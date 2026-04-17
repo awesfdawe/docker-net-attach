@@ -1,5 +1,9 @@
 # docker-net-attach
 
+## TODO
+
+- rewrite this shitty readme
+
 Lightweight, event-driven network controller for Docker that implements **Zero Trust microsegmentation** on a single host.
 
 ## Problem
