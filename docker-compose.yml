@@ -1,0 +1,10 @@
+services:
+  docker-net-attach:
+    build: .
+    container_name: docker-net-attach
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - "ALLOWED_GATEWAYS=traefik,mihomo"
+      - "IGNORED_NETWORKS=bridge,host,none"

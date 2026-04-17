@@ -1,0 +1,14 @@
+[project]
+name = "docker-net-attach"
+version = "0.0.1"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+license = "MIT"
+dependencies = [
+    "httpx>=0.28.1",
+    "loguru>=0.7.3",
+]
+
+[tool.ruff]
+line-length = 120
