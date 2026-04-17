@@ -43,5 +43,6 @@ class Config:
             dry_run=os.getenv("DRY_RUN", "false").lower() == "true",
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             allowed_gateways=gateways,
-            ignored_networks=_parse_frozenset(os.getenv("IGNORED_NETWORKS", "")),
+            ignored_networks=_parse_frozenset(os.getenv("IGNORED_NETWORKS", ""))
+            | frozenset({"bridge", "host", "none", "ingress", "docker_gwbridge"}),
         )

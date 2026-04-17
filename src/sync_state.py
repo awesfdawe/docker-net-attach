@@ -44,6 +44,16 @@ def _container_names(container: dict) -> list[str]:
     return [n.lstrip("/") for n in container.get("Names", [])]
 
 
+def _get_networks(container: dict) -> set[str]:
+    """Safely extract all network names a container is connected to.
+
+    Compatible with both ``/containers/json`` (list) and ``/containers/{id}/json``
+    (inspect) — both expose ``NetworkSettings.Networks`` as a name-keyed dict.
+    """
+    networks = container.get("NetworkSettings", {}).get("Networks")
+    return set(networks.keys()) if isinstance(networks, dict) else set()
+
+
 def _is_ready(container: dict) -> bool:
     """Return True if the container is running and healthy (or has no healthcheck).
 
@@ -52,7 +62,7 @@ def _is_ready(container: dict) -> bool:
     """
     if container.get("State") != "running":
         return False
-    status = container.get("Status", "")
+    status = container.get("Status", "").lower()
     if "(unhealthy)" in status or "(health: starting)" in status:
         return False
     return True
@@ -74,11 +84,24 @@ def _is_ready_inspect(container: dict) -> bool:
 
 
 def _build_ignored(gateway_container: dict, config: Config) -> set[str]:
-    """Merge global IGNORED_NETWORKS with per-gateway ``ignored_networks`` label."""
+    """Merge global IGNORED_NETWORKS with per-gateway ignored labels.
+
+    Automatically ignores the gateway's Docker Compose default network
+    (``{project}_default``).  For any other gateway-local networks, use the
+    ``IGNORED_NETWORKS`` env variable or the per-gateway
+    ``docker-net-attach.ignored_networks`` label.
+    """
     ignored = set(config.ignored_networks)
-    label = gateway_container.get("Labels", {}).get(f"{config.label_prefix}.ignored_networks")
+    labels = gateway_container.get("Labels", {}) or {}
+
+    label = labels.get(f"{config.label_prefix}.ignored_networks")
     if label:
         ignored.update(n.strip() for n in label.split(",") if n.strip())
+
+    compose_project = labels.get("com.docker.compose.project")
+    if compose_project:
+        ignored.add(f"{compose_project}_default")
+
     return ignored
 
 
@@ -97,8 +120,7 @@ async def _apply(
     if dry_run:
         for net in sorted(networks):
             logger.info(
-                f"[DRY RUN] Would {action.lower()} '{gateway}' "
-                f"{'to' if action == 'ATTACH' else 'from'} '{net}'"
+                f"[DRY RUN] Would {action.lower()} '{gateway}' {'to' if action == 'ATTACH' else 'from'} '{net}'"
             )
         return
 
@@ -129,13 +151,17 @@ async def sync_state(docker: DockerClient, config: Config) -> None:
         logger.error("Failed to fetch containers for state sync")
         return
 
-    # Phase 1: identify gateway containers
+    # Phase 1: identify gateway containers (prefer running over stopped)
     gateways: dict[str, dict] = {}
     for container in containers:
         for name in _container_names(container):
             if name in config.allowed_gateways:
-                if name in gateways:
-                    logger.warning(f"Duplicate gateway '{name}' detected — using latest")
+                existing = gateways.get(name)
+                if existing is not None:
+                    if existing.get("State") == "running":
+                        logger.warning(f"Duplicate gateway '{name}' — keeping running instance")
+                        continue
+                    logger.warning(f"Duplicate gateway '{name}' — replacing stopped instance")
                 gateways[name] = container
 
     # Phase 2: build desired network map from labelled containers
@@ -143,20 +169,20 @@ async def sync_state(docker: DockerClient, config: Config) -> None:
 
     for container in containers:
         names = _container_names(container)
-        if any(n in config.allowed_gateways for n in names):
-            continue  # Skip gateway containers themselves
 
         labels = container.get("Labels", {}) or {}
         cid = container.get("Id", "")[:12]
-        actual_nets = set((container.get("NetworkSettings", {}).get("Networks", {}) or {}).keys())
+        actual_nets = _get_networks(container)
         ready = _is_ready(container)
 
         intents = parse_intents(labels, config)
         for intent in intents:
+            if any(n == intent.gateway for n in names):
+                continue  # Gateways cannot connect to themselves dynamically
+
             if not intent.networks:
                 logger.warning(
-                    f"Container '{cid}' has {config.label_prefix}.{intent.gateway}.enable=true "
-                    f"but no network label"
+                    f"Container '{cid}' has {config.label_prefix}.{intent.gateway}.enable=true but no network label"
                 )
                 continue
 
@@ -174,7 +200,7 @@ async def sync_state(docker: DockerClient, config: Config) -> None:
             logger.debug(f"Gateway '{gw}' not found — skipping")
             continue
 
-        current_nets = set((gw_container.get("NetworkSettings", {}).get("Networks", {}) or {}).keys())
+        current_nets = _get_networks(gw_container)
         ignored = _build_ignored(gw_container, config)
 
         to_attach = desired_nets - current_nets
@@ -195,12 +221,11 @@ async def targeted_attach(docker: DockerClient, config: Config, container_id: st
     """
     container = await docker.get_container(container_id)
     if container is None:
+        logger.debug(f"Container '{container_id[:12]}' not found (removed between event and inspect)")
         return False
 
-    # Don't process gateway containers themselves
+    # Get the clean container name
     name = (container.get("Name") or "").lstrip("/")
-    if name in config.allowed_gateways:
-        return False
 
     # Verify the container is still running and healthy (may have died between event and inspect)
     if not _is_ready_inspect(container):
@@ -208,7 +233,7 @@ async def targeted_attach(docker: DockerClient, config: Config, container_id: st
         return False
 
     labels = container.get("Config", {}).get("Labels", {}) or {}
-    actual_nets = set((container.get("NetworkSettings", {}).get("Networks", {}) or {}).keys())
+    actual_nets = _get_networks(container)
 
     intents = parse_intents(labels, config)
     if not intents:
@@ -216,6 +241,9 @@ async def targeted_attach(docker: DockerClient, config: Config, container_id: st
 
     acted = False
     for intent in intents:
+        if name == intent.gateway:
+            continue  # Gateways cannot connect to themselves dynamically
+
         for net in intent.networks:
             if net not in actual_nets:
                 logger.warning(f"Container '{name}' requests '{net}' but is not a member — skipped")

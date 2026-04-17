@@ -1,4 +1,6 @@
+import asyncio
 import json
+import urllib.parse
 from collections.abc import AsyncGenerator
 
 import httpx
@@ -49,13 +51,13 @@ class DockerClient:
             response.raise_for_status()
             return response
         except httpx.HTTPStatusError as exc:
-            logger.error(
-                f"HTTP {exc.response.status_code} at {exc.request.url}: "
-                f"{exc.response.text.strip()[:300]}"
-            )
+            if exc.response.status_code == 404:
+                return None
+            logger.error(f"HTTP {exc.response.status_code} at {exc.request.url}: {exc.response.text.strip()[:300]}")
+            raise
         except httpx.RequestError as exc:
             logger.error(f"Request error at {exc.request.url}: {exc}")
-        return None
+            raise
 
     # --- Read operations --------------------------------------------------------
 
@@ -69,13 +71,6 @@ class DockerClient:
         resp = await self._request("GET", f"/containers/{container_id}/json")
         return resp.json() if resp else None
 
-    async def get_network_name(self, network_id: str) -> str | None:
-        """Resolve a network ID to its human-readable name."""
-        resp = await self._request("GET", f"/networks/{network_id}")
-        if resp is None:
-            return None
-        return resp.json().get("Name")
-
     # --- Network mutations (status-aware error handling) ------------------------
 
     async def connect_network(self, network: str, container_name: str) -> bool:
@@ -84,9 +79,10 @@ class DockerClient:
         Returns True on success or if already connected (409 is idempotent).
         """
         try:
+            safe_net = urllib.parse.quote(network, safe="")
             resp = await self._client.request(
                 "POST",
-                f"/networks/{network}/connect",
+                f"/networks/{safe_net}/connect",
                 json={"Container": container_name},
             )
             resp.raise_for_status()
@@ -98,17 +94,18 @@ class DockerClient:
                 return True
             if code == 404:
                 logger.warning(f"Network '{network}' or container '{container_name}' not found")
+                return False
             elif code == 403:
                 logger.error(f"Permission denied connecting '{container_name}' to '{network}'")
+                return False
             else:
                 logger.error(
-                    f"HTTP {code} connecting '{container_name}' to '{network}': "
-                    f"{exc.response.text.strip()[:200]}"
+                    f"HTTP {code} connecting '{container_name}' to '{network}': {exc.response.text.strip()[:200]}"
                 )
-            return False
+                raise
         except httpx.RequestError as exc:
             logger.error(f"Request error connecting '{container_name}' to '{network}': {exc}")
-            return False
+            raise
 
     async def disconnect_network(self, network: str, container_name: str) -> bool:
         """Detach a container from a network.
@@ -116,9 +113,10 @@ class DockerClient:
         Returns True on success or if already disconnected (404 is idempotent).
         """
         try:
+            safe_net = urllib.parse.quote(network, safe="")
             resp = await self._client.request(
                 "POST",
-                f"/networks/{network}/disconnect",
+                f"/networks/{safe_net}/disconnect",
                 json={"Container": container_name, "Force": True},
             )
             resp.raise_for_status()
@@ -130,27 +128,28 @@ class DockerClient:
                 return True
             if code == 403:
                 logger.error(f"Permission denied disconnecting '{container_name}' from '{network}'")
+                return False
             else:
                 logger.error(
-                    f"HTTP {code} disconnecting '{container_name}' from '{network}': "
-                    f"{exc.response.text.strip()[:200]}"
+                    f"HTTP {code} disconnecting '{container_name}' from '{network}': {exc.response.text.strip()[:200]}"
                 )
-            return False
+                raise
         except httpx.RequestError as exc:
             logger.error(f"Request error disconnecting '{container_name}' from '{network}': {exc}")
-            return False
+            raise
 
     # --- Event stream -----------------------------------------------------------
 
-    async def get_events(self) -> AsyncGenerator[str, None]:
+    async def get_events(self, on_ready: asyncio.Event | None = None) -> AsyncGenerator[str, None]:
         """Subscribe to filtered Docker event stream. Yields raw JSON lines."""
         filters = {
-            "type": ["container"],
+            "type": ["container", "network"],
             "event": [
                 "start",
                 "die",
                 "health_status: healthy",
                 "health_status: unhealthy",
+                "disconnect",
             ],
         }
         params = {"filters": json.dumps(filters)}
@@ -158,14 +157,13 @@ class DockerClient:
         try:
             async with self._client.stream("GET", "/events", params=params, timeout=None) as response:
                 response.raise_for_status()
+                if on_ready:
+                    on_ready.set()
                 async for line in response.aiter_lines():
                     if line:
                         yield line
         except httpx.HTTPStatusError as exc:
-            logger.error(
-                f"HTTP {exc.response.status_code} in event stream: "
-                f"{exc.response.text.strip()[:300]}"
-            )
+            logger.error(f"HTTP {exc.response.status_code} in event stream: {exc.response.text.strip()[:300]}")
             raise
         except httpx.RequestError as exc:
             logger.error(f"Request error in event stream: {exc}")
